@@ -87,14 +87,13 @@ func (w *PkgFinder) walkPath(walker *fs.Walker, find string, pkg string, compone
 	stat := walker.Stat()
 	if w.cache.fullScan {
 		mtime := stat.ModTime().Unix()
-		w.cache.add(&cacheKey{Path: pkg, NumComponents: len(*components)}, mtime)
+		w.cache.add(pkg, mtime)
 	} else {
 		mtime := stat.ModTime().Unix()
-		k := &cacheKey{Path: pkg, NumComponents: len(*components)}
-		prevMtime, inCache := w.cache.get(k)
+		prevMtime, inCache := w.cache.get(pkg)
 		if !inCache {
 			w.cache.changed = true
-			w.cache.add(k, mtime)
+			w.cache.add(pkg, mtime)
 		}
 		if _, found := w.matchComponent(find, components); found {
 			in := sort.SearchStrings(*matches, pkg)
@@ -186,8 +185,7 @@ func (w *PkgFinder) isValid(find string) (OrderedRanks, bool) {
 }
 
 func (w *PkgFinder) findInCache(find string) (OrderedRanks, bool) {
-	components := strings.Split(find, string(filepath.Separator))
-	paths, fullMatch := w.cache.contains(&cacheKey{Path: find, NumComponents: len(components)}, 1)
+	paths, fullMatch := w.cache.contains(find, 1)
 	if fullMatch {
 		if w.cache.fullScan {
 			return OrderedRanks{
@@ -275,8 +273,7 @@ func (w *PkgFinder) recheckPaths(paths []string) OrderedRanks {
 				Target: abs,
 			})
 		} else { // path is not valid anymore
-			components := strings.Split(path, string(filepath.Separator))
-			w.cache.del(&cacheKey{Path: path, NumComponents: len(components)})
+			w.cache.del(path)
 		}
 	}
 	return ret
@@ -286,18 +283,18 @@ func (w *PkgFinder) fuzzyFindMatches(find string, num int) OrderedRanks {
 	matches := make(map[string]fuzzy.Rank)
 
 	for entry := range w.cache.storage {
-		path := append(strings.Split(entry.Path, string(filepath.Separator)), entry.Path)
+		path := append(strings.Split(entry, string(filepath.Separator)), entry)
 		ranks := fuzzy.RankFindFold(find, path)
 
 		for _, r := range ranks {
 			if r.Distance > 10 {
 				continue
 			}
-			m, ok := matches[entry.Path]
+			m, ok := matches[entry]
 
 			if (ok && r.Distance < m.Distance) || !ok {
-				r.Target = filepath.Join(w.gopath, entry.Path)
-				matches[entry.Path] = r
+				r.Target = filepath.Join(w.gopath, entry)
+				matches[entry] = r
 			}
 		}
 	}

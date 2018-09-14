@@ -17,15 +17,10 @@ const (
 	PrevsFile = "$HOME/.cache/gocd/prevs"
 )
 
-type cacheKey struct {
-	Path          string
-	NumComponents int
-}
-
 // cache caches the contents of a directory for faster lookups.
 type cache struct {
 	file    string
-	storage map[cacheKey]int64 // probably a trie would be better
+	storage map[string]int64
 
 	// changed is set when the folder structure has changed compared to the cache
 	changed  bool
@@ -36,7 +31,7 @@ type cache struct {
 func newCache(file string) *cache {
 	c := &cache{
 		file:    file,
-		storage: make(map[cacheKey]int64),
+		storage: make(map[string]int64),
 	}
 	c.loadCache()
 	return c
@@ -76,40 +71,40 @@ func (c *cache) save() error {
 	return nil
 }
 
-func (c *cache) add(k *cacheKey, mtime int64) {
-	c.storage[*k] = mtime
+func (c *cache) add(path string, mtime int64) {
+	c.storage[path] = mtime
 	c.changed = true
 }
 
-func (c *cache) get(k *cacheKey) (int64, bool) {
-	v, ok := c.storage[*k]
+func (c *cache) get(path string) (int64, bool) {
+	v, ok := c.storage[path]
 	return v, ok
 }
 
-func (c *cache) del(k *cacheKey) {
-	if _, ok := c.get(k); !ok {
+func (c *cache) del(path string) {
+	if _, ok := c.get(path); !ok {
 		return
 	}
 	c.changed = true
-	delete(c.storage, *k)
+	delete(c.storage, path)
 }
 
 // contains returns a slice of matches, at most `max`. If the second return
 // value is true, it is a full match, that is not only a part of the path's
 // components matched, thus in that case the return slice has length 1, the
 // matching path.
-func (c *cache) contains(k *cacheKey, max int) ([]string, bool) {
-	_, found := c.get(k)
+func (c *cache) contains(path string, max int) ([]string, bool) {
+	_, found := c.get(path)
 	if found {
-		return []string{k.Path}, true
+		return []string{path}, true
 	}
 	ret := make([]string, 0, max)
 	for entry := range c.storage {
-		components := strings.Split(entry.Path, string(filepath.Separator))
+		components := strings.Split(entry, string(filepath.Separator))
 		for x := len(components) - 1; x >= 0; x-- {
 			p := filepath.Join(components[x:]...)
-			if k.Path == p {
-				ret = append(ret, entry.Path)
+			if path == p {
+				ret = append(ret, entry)
 				if len(ret) > max {
 					return ret, false
 				}
