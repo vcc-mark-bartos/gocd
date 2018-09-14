@@ -6,8 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	rbt "github.com/emirpasic/gods/trees/redblacktree"
 )
 
 const (
@@ -19,11 +17,15 @@ const (
 	PrevsFile = "$HOME/.cache/gocd/prevs"
 )
 
+type cacheKey struct {
+	Path          string
+	NumComponents int
+}
+
 // cache caches the contents of a directory for faster lookups.
 type cache struct {
-	file     string
-	maxDepth int
-	cacheStorage
+	file    string
+	storage map[cacheKey]int64 // probably a trie would be better
 
 	// changed is set when the folder structure has changed compared to the cache
 	changed  bool
@@ -33,10 +35,8 @@ type cache struct {
 // Creates and loads (according to `file`) a new `cache`.
 func newCache(file string) *cache {
 	c := &cache{
-		file: file,
-		cacheStorage: cacheStorage{
-			rbt.NewWithStringComparator(),
-		},
+		file:    file,
+		storage: make(map[cacheKey]int64),
 	}
 	c.loadCache()
 	return c
@@ -49,7 +49,7 @@ func (c *cache) loadCache() {
 		c.fullScan = true
 		return
 	}
-	if err := c.cacheStorage.deserialize(c.file); err != nil {
+	if err := c.deserialize(c.file); err != nil {
 		c.loadCacheFail(err)
 		return
 	}
@@ -70,93 +70,71 @@ func (c *cache) save() error {
 	if err != nil {
 		return err
 	}
-	if err := c.cacheStorage.serialize(c.file); err != nil {
+	if err := c.serialize(c.file); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (c *cache) contains(path string) ([]string, bool) {
-	ret := make([]string, 0, 10)
-	_, found := c.cacheStorage.Get(path)
-	if found {
-		return ret, true
+func (c *cache) add(k *cacheKey, mtime int64) {
+	c.storage[*k] = mtime
+	c.changed = true
+}
+
+func (c *cache) get(k *cacheKey) (int64, bool) {
+	v, ok := c.storage[*k]
+	return v, ok
+}
+
+func (c *cache) del(k *cacheKey) {
+	if _, ok := c.get(k); !ok {
+		return
 	}
-	it := c.cacheStorage.Iterator()
-	for it.Next() {
-		entry := it.Key().(string)
-		components := strings.Split(entry, string(filepath.Separator))
+	c.changed = true
+	delete(c.storage, *k)
+}
+
+// contains returns a slice of matches, at most `max`. If the second return
+// value is true, it is a full match, that is not only a part of the path's
+// components matched, thus in that case the return slice has length 1, the
+// matching path.
+func (c *cache) contains(k *cacheKey, max int) ([]string, bool) {
+	_, found := c.get(k)
+	if found {
+		return []string{k.Path}, true
+	}
+	ret := make([]string, 0, max)
+	for entry := range c.storage {
+		components := strings.Split(entry.Path, string(filepath.Separator))
 		for x := len(components) - 1; x >= 0; x-- {
 			p := filepath.Join(components[x:]...)
-			if path == p {
-				ret = append(ret, entry)
-				if len(ret) > 10 {
+			if k.Path == p {
+				ret = append(ret, entry.Path)
+				if len(ret) > max {
 					return ret, false
 				}
 			}
 		}
+
 	}
 	return ret, false
 }
 
-func (c *cache) containsStrict(path string) (string, bool) {
-	_, found := c.cacheStorage.Get(path)
-	if found {
-		return path, true
-	}
-	it := c.cacheStorage.Iterator()
-	for it.Next() {
-		entry := it.Key().(string)
-		components := strings.Split(entry, string(filepath.Separator))
-		for x := len(components) - 1; x >= 0; x-- {
-			p := filepath.Join(components[x:]...)
-			if path == p {
-				return entry, false
-			}
-		}
-	}
-	return "", false
-}
-
-type cacheStorageEntry struct {
-	Path  string
-	Mtime int64
-}
-
-type cacheStorage struct {
-	*rbt.Tree // if no need for ordered keys overkill
-}
-
-func (tree *cacheStorage) deserialize(path string) error {
+func (c *cache) deserialize(path string) error {
 	file, err := os.OpenFile(path, os.O_RDONLY, 0644)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
 
-	elements := make([]cacheStorageEntry, tree.Size())
 	dec := gob.NewDecoder(file)
-	if err := dec.Decode(&elements); err != nil {
+	if err := dec.Decode(&c.storage); err != nil {
 		return err
-	}
-	tree.Clear()
-	for _, elem := range elements {
-		tree.Put(elem.Path, elem.Mtime)
 	}
 	return nil
 }
 
-func (tree *cacheStorage) serialize(path string) error {
-	elements := make([]cacheStorageEntry, tree.Size())
-	it := tree.Iterator()
-	for it.Next() {
-		elem := cacheStorageEntry{
-			Path:  it.Key().(string),
-			Mtime: it.Value().(int64),
-		}
-		elements = append(elements, elem)
-	}
-
+func (c *cache) serialize(path string) error {
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE, 0644)
 	if err != nil {
 		return err
@@ -164,37 +142,7 @@ func (tree *cacheStorage) serialize(path string) error {
 	defer file.Close()
 
 	enc := gob.NewEncoder(file)
-	if err = enc.Encode(elements); err != nil {
-		return err
-	}
-	return nil
-}
-
-func loadPrevs() (OrderedRanks, error) {
-	prevsFile := os.ExpandEnv(PrevsFile)
-	file, err := os.OpenFile(prevsFile, os.O_RDONLY, 0644)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	prevs := make(OrderedRanks, 10)
-	dec := gob.NewDecoder(file)
-	if err := dec.Decode(&prevs); err != nil {
-		return nil, err
-	}
-	return prevs, nil
-}
-
-func savePrevs(prevs OrderedRanks) error {
-	file, err := os.OpenFile(os.ExpandEnv(PrevsFile), os.O_WRONLY|os.O_CREATE, 0644)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	enc := gob.NewEncoder(file)
-	if err = enc.Encode(prevs); err != nil {
+	if err = enc.Encode(c.storage); err != nil {
 		return err
 	}
 	return nil

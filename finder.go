@@ -12,8 +12,24 @@ import (
 	"github.com/renstrom/fuzzysearch/fuzzy"
 )
 
-// OrderedRanks contains paths ordered by their `Distance` if equal then `Target`.
+// OrderedRanks contains paths with a `Distance` field denoting how far they are
+// from a base path.
 type OrderedRanks []fuzzy.Rank
+
+func (r *OrderedRanks) rank(rel string, by string) {
+	for _, elem := range *r {
+		entry, _ := filepath.Rel(rel, elem.Target)
+		path := append(strings.Split(entry, string(filepath.Separator)), entry)
+		ranks := fuzzy.RankFindFold(by, path)
+		min := ranks[0].Distance
+		for _, r := range ranks {
+			if r.Distance < min {
+				min = r.Distance
+			}
+		}
+		elem.Distance = min
+	}
+}
 
 func (r OrderedRanks) Len() int {
 	return len(r)
@@ -55,19 +71,51 @@ func NewPkgFinder(path string, depth int) *PkgFinder {
 	}
 }
 
-// checkRelPath scans every component of the relative path until it finds a
-// direct match.
-func (w *PkgFinder) checkRelPath(find string, components *[]string) bool {
-	for x := len(*components) - 1; x >= 0; x-- {
-		if find == filepath.Join((*components)[x:]...) {
-			return true
+// matchComponent scans every component of the relative path until it finds a
+// match.
+func (w *PkgFinder) matchComponent(find string, components *[]string) (string, bool) {
+	for x := 0; x < len(*components); x++ {
+		path := filepath.Join((*components)[x:]...)
+		if find == path {
+			return path, true
 		}
 	}
-	return false
+	return "", false
+}
+
+func (w *PkgFinder) walkPath(walker *fs.Walker, find string, pkg string, components *[]string, matches *[]string) {
+	stat := walker.Stat()
+	if w.cache.fullScan {
+		mtime := stat.ModTime().Unix()
+		w.cache.add(&cacheKey{Path: pkg, NumComponents: len(*components)}, mtime)
+	} else {
+		mtime := stat.ModTime().Unix()
+		k := &cacheKey{Path: pkg, NumComponents: len(*components)}
+		prevMtime, inCache := w.cache.get(k)
+		if !inCache {
+			w.cache.changed = true
+			w.cache.add(k, mtime)
+		}
+		if _, found := w.matchComponent(find, components); found {
+			in := sort.SearchStrings(*matches, pkg)
+			if len(*matches) <= in {
+				*matches = append(*matches, pkg)
+			}
+			return
+		}
+		// Due to how inodes work (the current inode's mtime only changes if a
+		// direct child is modified, it remains unchanged for grandchild and so
+		// on) we can only use mtime to skip the last level
+		if w.depthLimit-1 == depth {
+			if inCache && mtime <= prevMtime {
+				walker.SkipDir()
+			}
+		}
+	}
 }
 
 func (w *PkgFinder) walker(root string, find string) []string {
-	prevCache := make([]string, 0, 10)
+	prevCache := make([]string, 0)
 	walker := fs.Walk(root)
 	for walker.Step() {
 		if err := walker.Err(); err != nil {
@@ -78,6 +126,9 @@ func (w *PkgFinder) walker(root string, find string) []string {
 		isDir := stat.IsDir()
 		path := walker.Path()
 
+		if path == w.gopath {
+			continue
+		}
 		// pkg is the package path, so we only use its parent dir if it is a file
 		// otherwise we through off the depth calculation
 		var pkg string
@@ -96,58 +147,30 @@ func (w *PkgFinder) walker(root string, find string) []string {
 		if depthLimitHit {
 			walker.SkipDir()
 		}
-		if path == w.gopath {
+		if !isDir { // we only care about folders
 			continue
 		}
 		// Skip if path contains .git or vendor
-		if isDir && (strings.HasPrefix(stat.Name(), ".") || strings.HasPrefix(stat.Name(), "_") || strings.Contains(path, "vendor")) {
+		if isDir &&
+			(strings.HasPrefix(stat.Name(), ".") ||
+				strings.HasPrefix(stat.Name(), "_") ||
+				strings.Contains(path, "vendor")) {
 			walker.SkipDir()
 			continue
 		}
-		if w.cache.fullScan {
-			mtime := stat.ModTime().Unix()
-			w.cache.cacheStorage.Put(pkg, mtime)
-		} else {
-			mtime := stat.ModTime().Unix()
-			ret, full := w.cache.containsStrict(pkg)
-			if !full {
-				w.cache.changed = true
-				w.cache.cacheStorage.Put(ret, mtime)
-			}
-			if found := w.checkRelPath(find, &components); found {
-				prevCache = append(prevCache, pkg)
-				if len(prevCache) > 10 {
-					return prevCache
-				}
-				continue
-			}
-			// Due to how inodes work (the current inode's mtime only changes if a
-			// direct child is modified, it remains unchanged for grandchild and so
-			// on) we can only use mtime to skip the last level
-			if w.depthLimit-1 == depth {
-				v, found := w.cache.cacheStorage.Get(pkg)
-				if !found {
-					continue
-				}
-				prevMtime := v.(int64)
-				if mtime <= prevMtime {
-					walker.SkipDir()
-				}
-			}
-		}
+		w.walkPath(walker, find, pkg, &components, &prevCache)
 	}
 	return prevCache
 }
 
-// Find a package by the given key
-func (w *PkgFinder) Find(find string) (OrderedRanks, error) {
+func (w *PkgFinder) isValid(find string) (OrderedRanks, bool) {
 	// If absolute path then go straight to it
 	if path.IsAbs(find) {
 		return OrderedRanks{
 			{
 				Target: find,
 			},
-		}, nil
+		}, true
 	}
 	// If path is a real path relative to gopath then use it
 	abs := filepath.Join(w.gopath, find)
@@ -157,7 +180,56 @@ func (w *PkgFinder) Find(find string) (OrderedRanks, error) {
 			{
 				Target: abs,
 			},
-		}, nil
+		}, true
+	}
+	return nil, false
+}
+
+func (w *PkgFinder) findInCache(find string) (OrderedRanks, bool) {
+	components := strings.Split(find, string(filepath.Separator))
+	paths, fullMatch := w.cache.contains(&cacheKey{Path: find, NumComponents: len(components)}, 1)
+	if fullMatch {
+		if w.cache.fullScan {
+			return OrderedRanks{
+				{
+					Target: filepath.Join(w.gopath, paths[0]),
+				},
+			}, true
+		}
+	}
+	valids := w.recheckPaths(paths)
+	if len(valids) > 0 {
+		return valids, fullMatch
+	}
+	return nil, false
+}
+
+func (w *PkgFinder) traverse(find string) OrderedRanks {
+	pkgs := w.walker(w.gopath, find)
+	pkgsLen := len(pkgs)
+	if pkgs != nil && pkgsLen > 0 {
+		if pkgsLen > 1 {
+			found := make(OrderedRanks, len(pkgs))
+			for i, r := range pkgs {
+				found[i] = fuzzy.Rank{
+					Target: filepath.Join(w.gopath, r),
+				}
+			}
+			return found
+		}
+		return OrderedRanks{
+			{
+				Target: filepath.Join(w.gopath, pkgs[0]),
+			},
+		}
+	}
+	return nil
+}
+
+// Find a package by the given key.
+func (w *PkgFinder) Find(find string, max int) (OrderedRanks, error) {
+	if ret, found := w.isValid(find); found {
+		return ret, nil
 	}
 	defer func() {
 		if err := w.cache.save(); err != nil {
@@ -169,36 +241,27 @@ func (w *PkgFinder) Find(find string) (OrderedRanks, error) {
 		w.cache.changed = true
 		w.cache.fullScan = false
 	}
-	// If subpath exists in cache, try it
-	paths, fullMatch := w.cache.contains(find)
-	if !fullMatch && len(paths) > 0 {
-		return w.recheckPaths(paths)
+	// Try cache first for a full match only
+	cached, fullMatch := w.findInCache(find)
+	if cached != nil && fullMatch {
+		return cached, nil
 	}
-	pkgs := w.walker(w.gopath, find)
-	pkgsLen := len(pkgs)
-	if pkgs != nil && pkgsLen > 0 {
-		if pkgsLen > 1 {
-			found := make(OrderedRanks, len(pkgs))
-			for i, r := range pkgs {
-				found[i] = fuzzy.Rank{
-					Target: filepath.Join(w.gopath, r),
-				}
-			}
-			return found, nil
-		}
-		return OrderedRanks{
-			{
-				Target: filepath.Join(w.gopath, pkgs[0]),
-			},
-		}, nil
-	}
-	// Search in the whole of the hot cache for the best 10 match
-	found := w.findSomeMatch(find, 10)
+	// Otherwise traverse the dir tree to avoid the cache never being updated
+	possibleMatches := w.traverse(find)
 
-	return found, nil
+	if len(possibleMatches) > 1 {
+		possibleMatches.rank(w.gopath, find)
+		sort.Sort(possibleMatches)
+		return possibleMatches, nil
+	}
+	// We could not find any matches, so try a fuzzy search of all the cached
+	// paths (at this point the whole cache has been updated)
+	fuzzyMatches := w.fuzzyFindMatches(find, 10)
+
+	return fuzzyMatches, nil
 }
 
-func (w *PkgFinder) recheckPaths(paths []string) (OrderedRanks, error) {
+func (w *PkgFinder) recheckPaths(paths []string) OrderedRanks {
 	ret := make(OrderedRanks, 0, len(paths))
 	for _, path := range paths {
 		var err error
@@ -211,33 +274,30 @@ func (w *PkgFinder) recheckPaths(paths []string) (OrderedRanks, error) {
 			ret = append(ret, fuzzy.Rank{
 				Target: abs,
 			})
+		} else { // path is not valid anymore
+			components := strings.Split(path, string(filepath.Separator))
+			w.cache.del(&cacheKey{Path: path, NumComponents: len(components)})
 		}
 	}
-	return ret, nil
+	return ret
 }
 
-func (w *PkgFinder) findSomeMatch(find string, num int) OrderedRanks {
-	return w.sort(find, w.cache.cacheStorage.Keys(), num)
-}
-
-func (w *PkgFinder) sort(by string, paths []interface{}, max int) OrderedRanks {
+func (w *PkgFinder) fuzzyFindMatches(find string, num int) OrderedRanks {
 	matches := make(map[string]fuzzy.Rank)
 
-	for i, p := range paths {
-		entry := p.(string)
-		path := append(strings.Split(entry, string(filepath.Separator)), entry)
-		ranks := fuzzy.RankFindFold(by, path)
+	for entry := range w.cache.storage {
+		path := append(strings.Split(entry.Path, string(filepath.Separator)), entry.Path)
+		ranks := fuzzy.RankFindFold(find, path)
 
 		for _, r := range ranks {
 			if r.Distance > 10 {
 				continue
 			}
-			m, ok := matches[entry]
+			m, ok := matches[entry.Path]
 
 			if (ok && r.Distance < m.Distance) || !ok {
-				r.Target = filepath.Join(w.gopath, entry)
-				matches[entry] = r
-				i++
+				r.Target = filepath.Join(w.gopath, entry.Path)
+				matches[entry.Path] = r
 			}
 		}
 	}
@@ -251,8 +311,8 @@ func (w *PkgFinder) sort(by string, paths []interface{}, max int) OrderedRanks {
 		i++
 	}
 	sort.Sort(ret)
-	if len(ret) > max {
-		ret = ret[:max]
+	if len(ret) > num {
+		ret = ret[:num]
 	}
 	return ret
 }

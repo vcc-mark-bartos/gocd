@@ -1,7 +1,6 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,12 +13,7 @@ const (
 	VendorToken = "^"
 )
 
-func TryGoToVendorParent() (bool, error) {
-	arg := flag.Arg(0)
-	if arg != VendorToken {
-		return false, nil
-	}
-
+func goToVendorParent() (bool, error) {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return false, err
