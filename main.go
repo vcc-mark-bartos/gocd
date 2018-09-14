@@ -83,6 +83,10 @@ func find(inPath string) bool {
 		if err != nil {
 			log.Fatalf("cannot parse requested index %s: %s", flag.Arg(1), err)
 		}
+		max := len(matches) - 1
+		if i > max {
+			log.Fatalf("%d is an invalid index (max %d)", i, max)
+		}
 		fmt.Println(matches[i].Target)
 		return true
 	}
