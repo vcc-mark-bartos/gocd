@@ -8,6 +8,13 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
+)
+
+const (
+	// VendorToken is the argument token used to indicate that gocd
+	// should change directory to the vendor's parent.
+	VendorToken = "^"
 )
 
 var (
@@ -40,12 +47,10 @@ func main() {
 
 	flag.Parse()
 
-	// If no path supplied then change directory to $GOPATH.
 	if flag.NArg() == 0 {
 		fmt.Print(path)
 		return
 	}
-	// Using '^', try to go to the vendor's parent
 	if flag.Arg(0) == VendorToken {
 		ok, err := goToVendorParent()
 		if err != nil {
@@ -62,18 +67,16 @@ func main() {
 }
 
 func find(inPath string) bool {
-	w := NewPkgFinder(inPath, depth)
+	w := NewPkgFinder(inPath, depth, 10)
 
-	matches, err := w.Find(flag.Arg(0), 10)
-	if err != nil {
-		log.Fatal(err)
-	}
+	matches := w.Find(flag.Arg(0))
+
 	if len(matches) < 1 {
 		fmt.Println("no match found")
 		return false
 	}
 	if len(matches) == 1 {
-		fmt.Println(matches[0].Target)
+		fmt.Println(filepath.Join(inPath, matches[0].Target))
 		return true
 	}
 	// If not just the package provided we assume there is a number to select
@@ -87,12 +90,37 @@ func find(inPath string) bool {
 		if i > max {
 			log.Fatalf("%d is an invalid index (max %d)", i, max)
 		}
-		fmt.Println(matches[i].Target)
+		fmt.Println(filepath.Join(inPath, matches[i].Target))
 		return true
 	}
 	for i, m := range matches {
-		rel, _ := filepath.Rel(inPath, m.Target)
-		log.Printf("  %d %s", i, rel)
+		fmt.Println(i, " ", m.Target)
 	}
 	return true
+}
+
+func goToVendorParent() (bool, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return false, err
+	}
+	if !strings.Contains(cwd, "vendor") {
+		return false, nil
+	}
+
+	components := strings.Split(cwd, string(filepath.Separator))
+	for i := len(components) - 1; i >= 0; i-- {
+		if components[i] == "vendor" {
+			if i == 0 {
+				// "vendor" is at the root of the path
+				return false, nil
+			}
+
+			var abs = append([]string{"/"}, components[:i]...)
+			fmt.Print(filepath.Join(abs...))
+			return true, nil
+		}
+	}
+
+	return false, nil
 }
